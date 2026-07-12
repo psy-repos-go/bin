@@ -74,6 +74,7 @@ type Filter struct {
 	name            string
 	packagePath     string
 	namePatternUsed bool
+	preferredUsed   bool
 }
 
 type FilterOpts struct {
@@ -94,6 +95,17 @@ type FilterOpts struct {
 	// and the part after matches files inside archives. Without a slash the
 	// whole pattern matches top-level asset names only.
 	NamePattern string
+
+	// PreferredAsset is the top-level asset name chosen on a previous
+	// install/upgrade and PreferredVersion is the version it was chosen at.
+	// On upgrades, FilterAssets compares the version-stripped form of this
+	// name against the version-stripped current candidates so the same
+	// artefact can be re-selected even though release names embed the version.
+	// CurrentVersion is the version of the release being fetched, used to
+	// strip the version from candidate names.
+	PreferredAsset   string
+	PreferredVersion string
+	CurrentVersion   string
 }
 
 type runtimeResolver struct{}
@@ -143,6 +155,28 @@ func (f *Filter) FilterAssets(repoName string, as []*Asset) (*FilteredAsset, err
 		}
 	}
 
+	// On upgrades, identify the artefact chosen previously so it can be
+	// offered as the default in the prompt. Asset names embed the version, so
+	// compare the version-stripped forms. The preference only applies to the
+	// top-level asset list (preferredUsed guards against the recursive call for
+	// files inside an archive, which is already handled by PackagePath).
+	var preferred string
+	var preferredAsset *Asset
+	if f.opts.PreferredAsset != "" && !f.preferredUsed {
+		f.preferredUsed = true
+		preferred = SanitizeName(f.opts.PreferredAsset, f.opts.PreferredVersion)
+		var prefMatches []*Asset
+		for _, a := range as {
+			if SanitizeName(a.Name, f.opts.CurrentVersion) == preferred {
+				prefMatches = append(prefMatches, a)
+			}
+		}
+		if len(prefMatches) == 1 {
+			preferredAsset = prefMatches[0]
+			log.Debugf("Asset %q matches previously selected artefact, offering it as the default", preferredAsset.Name)
+		}
+	}
+
 	var matches []*FilteredAsset
 	switch {
 	case len(as) == 1:
@@ -155,7 +189,22 @@ func (f *Filter) FilterAssets(repoName string, as []*Asset) (*FilteredAsset, err
 		matches = f.scoreAssets(repoName, as)
 	}
 
-	return selectCandidate(matches, toFilteredAssets(repoName, as))
+	// Make sure the previously selected artefact is always among the prompted
+	// options (scoring may otherwise drop it) so it can be shown as the default.
+	if preferredAsset != nil {
+		found := false
+		for _, m := range matches {
+			if m.Name == preferredAsset.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			matches = append(matches, &FilteredAsset{RepoName: repoName, Name: preferredAsset.Name, DisplayName: preferredAsset.DisplayName, URL: preferredAsset.URL})
+		}
+	}
+
+	return selectCandidate(matches, toFilteredAssets(repoName, as), preferred, f.opts.CurrentVersion)
 }
 
 // applyNamePattern filters assets to those matching the asset portion of
@@ -258,7 +307,11 @@ func keepHighestScored(matches []*FilteredAsset) []*FilteredAsset {
 // selectCandidate returns the single best match, or prompts the user when
 // multiple candidates remain. Returns an error if there are no candidates.
 // allAssets is the full unfiltered list offered as a fallback "List all" option.
-func selectCandidate(matches []*FilteredAsset, allAssets []*FilteredAsset) (*FilteredAsset, error) {
+// preferred is the version-stripped name of the previously selected artefact
+// (empty when there is none); when prompting, the candidate matching it is
+// offered as the default so pressing Enter keeps the same artefact. version is
+// the current release version, used to strip the version from candidate names.
+func selectCandidate(matches []*FilteredAsset, allAssets []*FilteredAsset, preferred, version string) (*FilteredAsset, error) {
 	switch len(matches) {
 	case 0:
 		return nil, fmt.Errorf("Could not find any compatible files")
@@ -276,7 +329,7 @@ func selectCandidate(matches []*FilteredAsset, allAssets []*FilteredAsset) (*Fil
 	if len(allAssets) > len(matches) {
 		generic = append(generic, options.LiteralStringer("Show all"))
 	}
-	choice, err := options.Select("Showing "+strconv.Itoa(len(matches))+" assets out of "+strconv.Itoa(len(allAssets))+". Select an option ", generic)
+	choice, err := options.SelectWithDefault("Showing "+strconv.Itoa(len(matches))+" assets out of "+strconv.Itoa(len(allAssets))+". Select an option ", generic, defaultIndex(generic, preferred, version))
 	if err != nil {
 		return nil, err
 	}
@@ -288,12 +341,26 @@ func selectCandidate(matches []*FilteredAsset, allAssets []*FilteredAsset) (*Fil
 		sort.SliceStable(all, func(i, j int) bool {
 			return all[i].String() < all[j].String()
 		})
-		choice, err = options.Select("Select from all available assets:", all)
+		choice, err = options.SelectWithDefault("Select from all available assets:", all, defaultIndex(all, preferred, version))
 		if err != nil {
 			return nil, err
 		}
 	}
 	return choice.(*FilteredAsset), nil
+}
+
+// defaultIndex returns the index of the option whose version-stripped name
+// matches preferred, or -1 when there is no preference or no match.
+func defaultIndex(opts []fmt.Stringer, preferred, version string) int {
+	if preferred == "" {
+		return -1
+	}
+	for i, o := range opts {
+		if fa, ok := o.(*FilteredAsset); ok && SanitizeName(fa.Name, version) == preferred {
+			return i
+		}
+	}
+	return -1
 }
 
 // SanitizeName removes irrelevant information from the
@@ -416,6 +483,19 @@ func (f *Filter) processReader(r io.Reader) (*finalFile, error) {
 	return &finalFile{Source: outputFile, Name: f.name, PackagePath: f.packagePath}, err
 }
 
+// packagePathMatches reports whether an archive entry matches the package
+// path stored on a previous install. Paths often embed the release version
+// (e.g. tool-v1.0.0-linux-amd64/tool), so when the exact comparison fails the
+// version-stripped forms are compared: the stored path is stripped of the
+// version it was recorded at (PreferredVersion) and the entry of the version
+// being fetched (CurrentVersion).
+func (f *Filter) packagePathMatches(entryName string) bool {
+	if entryName == f.opts.PackagePath {
+		return true
+	}
+	return SanitizeName(entryName, f.opts.CurrentVersion) == SanitizeName(f.opts.PackagePath, f.opts.PreferredVersion)
+}
+
 // processGz receives a tar.gz file and returns the
 // correct file for bin to download
 func (f *Filter) processGz(name string, r io.Reader) (*finalFile, error) {
@@ -444,7 +524,7 @@ func (f *Filter) processTar(name string, r io.Reader) (*finalFile, error) {
 			continue
 		}
 
-		if !f.opts.SkipPathCheck && len(f.opts.PackagePath) > 0 && header.Name != f.opts.PackagePath {
+		if !f.opts.SkipPathCheck && len(f.opts.PackagePath) > 0 && !f.packagePathMatches(header.Name) {
 			continue
 		}
 
@@ -526,7 +606,7 @@ func (f *Filter) processZip(name string, r io.Reader) (*finalFile, error) {
 			continue
 		}
 
-		if !f.opts.SkipPathCheck && len(f.opts.PackagePath) > 0 && header.Name != f.opts.PackagePath {
+		if !f.opts.SkipPathCheck && len(f.opts.PackagePath) > 0 && !f.packagePathMatches(header.Name) {
 			continue
 		}
 

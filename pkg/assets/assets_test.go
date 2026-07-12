@@ -204,6 +204,94 @@ func TestFilterAssetsNamePattern(t *testing.T) {
 	}
 }
 
+// TestFilterAssetsPreferred verifies that, on upgrades, the artefact chosen
+// previously is offered as the prompt default even though release asset names
+// embed the (changing) version. The prompt still appears; with no input (EOF in
+// the test) SelectWithDefault returns the default, so FilterAssets yields the
+// previously selected artefact.
+func TestFilterAssetsPreferred(t *testing.T) {
+	resolver = testLinuxAMDResolver
+
+	cases := []struct {
+		name             string
+		as               []*Asset
+		preferredAsset   string
+		preferredVersion string
+		currentVersion   string
+		want             string
+	}{
+		{
+			// musl and gnu variants score identically (both linux+amd64); the
+			// previous musl choice is re-selected across the version bump.
+			name: "re-selects same variant across versions",
+			as: []*Asset{
+				{Name: "tool-1.1.0-linux-amd64-musl.tar.gz"},
+				{Name: "tool-1.1.0-linux-amd64-gnu.tar.gz"},
+			},
+			preferredAsset:   "tool-1.0.0-linux-amd64-musl.tar.gz",
+			preferredVersion: "1.0.0",
+			currentVersion:   "1.1.0",
+			want:             "tool-1.1.0-linux-amd64-musl.tar.gz",
+		},
+		{
+			// preference overrides scoring: the raw binary and the archive both
+			// match the platform, but the previously selected archive wins.
+			name: "preference overrides scoring tie",
+			as: []*Asset{
+				{Name: "tool_1.1.0_linux_amd64"},
+				{Name: "tool_1.1.0_linux_amd64.tar.gz"},
+			},
+			preferredAsset:   "tool_1.0.0_linux_amd64.tar.gz",
+			preferredVersion: "1.0.0",
+			currentVersion:   "1.1.0",
+			want:             "tool_1.1.0_linux_amd64.tar.gz",
+		},
+	}
+
+	for _, c := range cases {
+		f := NewFilter(&FilterOpts{
+			PreferredAsset:   c.preferredAsset,
+			PreferredVersion: c.preferredVersion,
+			CurrentVersion:   c.currentVersion,
+		})
+		got, err := f.FilterAssets("tool", c.as)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", c.name, err)
+		}
+		if got.Name != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got.Name, c.want)
+		}
+	}
+}
+
+// TestDefaultIndex verifies the default-selection helper used to pre-select the
+// previously used artefact in the interactive prompt.
+func TestDefaultIndex(t *testing.T) {
+	resolver = testLinuxAMDResolver
+
+	opts := []fmt.Stringer{
+		&FilteredAsset{Name: "tool-2.0.0-linux-amd64-gnu.tar.gz"},
+		&FilteredAsset{Name: "tool-2.0.0-linux-amd64-musl.tar.gz"},
+	}
+
+	// Preferred musl variant from a previous version resolves to index 1.
+	want := SanitizeName("tool-1.0.0-linux-amd64-musl.tar.gz", "1.0.0")
+	if got := defaultIndex(opts, want, "2.0.0"); got != 1 {
+		t.Errorf("defaultIndex match: got %d, want 1", got)
+	}
+
+	// No preference yields no default.
+	if got := defaultIndex(opts, "", "2.0.0"); got != -1 {
+		t.Errorf("defaultIndex no-preference: got %d, want -1", got)
+	}
+
+	// A preference that no longer exists yields no default.
+	gone := SanitizeName("tool-1.0.0-linux-amd64-static.tar.gz", "1.0.0")
+	if got := defaultIndex(opts, gone, "2.0.0"); got != -1 {
+		t.Errorf("defaultIndex missing: got %d, want -1", got)
+	}
+}
+
 // makeTar builds an in-memory tar archive where every entry has mode 0755.
 func makeTar(files map[string]string) []byte {
 	var buf bytes.Buffer
@@ -300,6 +388,62 @@ func TestProcessZipNamePattern(t *testing.T) {
 		if result.Name != c.wantName {
 			t.Errorf("pattern %q: got name %q, want %q", c.pattern, result.Name, c.wantName)
 		}
+	}
+}
+
+// TestProcessTarPackagePathAcrossVersions verifies that a stored package path
+// embedding the release version (e.g. ecapture-v2.5.2-linux-amd64/ecapture)
+// still matches the corresponding entry of a newer release by comparing
+// version-stripped forms.
+func TestProcessTarPackagePathAcrossVersions(t *testing.T) {
+	resolver = testLinuxAMDResolver
+
+	data := makeTar(map[string]string{
+		"tool-v2.5.3-linux-amd64/tool":   "tool binary",
+		"tool-v2.5.3-linux-amd64/helper": "helper binary",
+	})
+
+	f := NewFilter(&FilterOpts{
+		PackagePath:      "tool-v2.5.2-linux-amd64/tool",
+		PreferredVersion: "v2.5.2",
+		CurrentVersion:   "v2.5.3",
+	})
+	result, err := f.processTar("repo", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.PackagePath != "tool-v2.5.3-linux-amd64/tool" {
+		t.Errorf("got package path %q, want %q", result.PackagePath, "tool-v2.5.3-linux-amd64/tool")
+	}
+	if result.Name != "tool" {
+		t.Errorf("got name %q, want %q", result.Name, "tool")
+	}
+}
+
+// TestProcessZipPackagePathAcrossVersions is the zip counterpart of
+// TestProcessTarPackagePathAcrossVersions.
+func TestProcessZipPackagePathAcrossVersions(t *testing.T) {
+	resolver = testLinuxAMDResolver
+
+	data := makeZip(map[string]string{
+		"tool-v2.5.3-linux-amd64/tool":   "tool binary",
+		"tool-v2.5.3-linux-amd64/helper": "helper binary",
+	})
+
+	f := NewFilter(&FilterOpts{
+		PackagePath:      "tool-v2.5.2-linux-amd64/tool",
+		PreferredVersion: "v2.5.2",
+		CurrentVersion:   "v2.5.3",
+	})
+	result, err := f.processZip("repo", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.PackagePath != "tool-v2.5.3-linux-amd64/tool" {
+		t.Errorf("got package path %q, want %q", result.PackagePath, "tool-v2.5.3-linux-amd64/tool")
+	}
+	if result.Name != "tool" {
+		t.Errorf("got name %q, want %q", result.Name, "tool")
 	}
 }
 
